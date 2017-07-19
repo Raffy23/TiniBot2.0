@@ -3,3 +3,6 @@
 *.idea
 *target*
 /application.conf
+.ensime
+ensime.sbt
+.ensime_cache/*

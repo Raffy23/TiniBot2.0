@@ -1,16 +1,14 @@
 package science.wasabi.tini.bot
 
 
-import akka.NotUsed
-import akka.stream.ActorMaterializer
-import akka.stream.scaladsl.{Sink, Source}
+import akka.stream.scaladsl.Sink
+import akka.stream.{ActorMaterializer, KillSwitches}
 import science.wasabi.tini._
 import science.wasabi.tini.bot.commands._
-import science.wasabi.tini.bot.discord.ingestion.{AkkaCordIngestion, Ingestion}
-import science.wasabi.tini.bot.discord.wrapper.DiscordMessage
+import science.wasabi.tini.bot.discord.ingestion.{AkkaCordApi, Api}
 import science.wasabi.tini.bot.kafka.KafkaStreams
+import science.wasabi.tini.bot.replies._
 import science.wasabi.tini.config.Config
-
 
 object BotMain extends App {
   println(Helper.greeting)
@@ -18,39 +16,59 @@ object BotMain extends App {
   implicit val config = Config.conf
   CommandRegistry.configure(config.bot.commands)
 
-  case class Ping(override val args: String) extends Command(args) {}
-  case class NoOp(override val args: String) extends Command(args) {}
-  case class UnkownCommand(override val args: String) extends Command(args) {}
-
-  "!ping" match {
-    case CommandRegistry(command) => println("testo: " + command)
+  class Ping(override val args: String, override val auxData: String) extends Command(args, auxData) {
+    def action: Reply = SimpleReply(auxData, "PONG")
+  }
+  class NoOp(override val args: String, override val auxData: String) extends Command(args, auxData) {
+    def action: Reply = NoReply()
   }
 
-  val ingestion: Ingestion = new AkkaCordIngestion
+  class Shutdown(override val args: String, override val auxData: String) extends Command(args, auxData) {
+    def action: Reply = {
+      if(args equals config.killSecret)
+        ShutdownReply()
+      else
+        NoReply()
+    }
+  }
 
   import scala.concurrent.ExecutionContext.Implicits.global
-  implicit val system = akka.actor.ActorSystem("kafka")
+  implicit val kafkaSystem = akka.actor.ActorSystem("kafka")
   implicit val materializer = ActorMaterializer()
 
-  val streams = new KafkaStreams
+  val sharedKillSwitch = KillSwitches.shared("shutdown")
+
+  val shutdownCallback: () => Unit = () => {
+    sharedKillSwitch.shutdown()
+    kafkaSystem.terminate()
+    ()
+  }
+
+  val api: Api = new AkkaCordApi(shutdownCallback)
+  val kafka = new KafkaStreams
 
   // pipe to kafka
-  val discordMessageStream: Source[DiscordMessage, NotUsed] = ingestion.source
-  val commandStream: Source[Command, NotUsed] = discordMessageStream.mapConcat[Command](dmsg =>
-    CommandRegistry.getCommandsFor(dmsg.content)
-  ) // TODO: actually map to commands
-  val commandTopicStream = commandStream.map(streams.mapToCommandTopic)
+  val commandTopicStream = api.source.map(kafka.toCommandTopic)
   commandTopicStream
-    .runWith(streams.sink)
+    .via(sharedKillSwitch.flow)
+    .runWith(kafka.sink)
     .foreach(_ => println("Done Producing"))
 
-  // read from kafka
-  val commandStreamFromKafka = streams.sourceFromCommandTopic()
+  // read from kafka, do stuff and send back
+  val commandStreamFromKafka = kafka.sourceFromCommandTopic()
   commandStreamFromKafka
-    .map(command => println("out: " + command))
-    .runWith(Sink.ignore)
-    .foreach(_ => println("Done Consuming"))
+    .map(command => {
+      command.action
+    })
+    .map(kafka.toReplyTopic)
+    .via(sharedKillSwitch.flow)
+    .runWith(kafka.sink)
 
-  // TODO: add the reply steam thingy
+  //read replies
+  val replyStreamFromKafka = kafka.sourceFromReplyTopic()
+  replyStreamFromKafka
+    .map(reply => api.handleReply(reply)) // maybe we should separate the APIs
+    .via(sharedKillSwitch.flow)
+    .runWith(Sink.ignore)
 }
 
