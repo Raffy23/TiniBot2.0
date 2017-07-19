@@ -77,7 +77,7 @@ lazy val bot = project
       "io.circe" %% "circe-core" % circeVersion,
       "io.circe" %% "circe-parser" % circeVersion,
       "io.circe" %% "circe-generic" % circeVersion,
-      "io.circe" %% "circe-literal" % circeVersion,
+      "io.circe" %% "circe-literal" % circeVersion
     ))
   .dependsOn(sharedJvm)
   .dependsOn(akkaCord)
